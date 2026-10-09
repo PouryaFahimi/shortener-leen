@@ -1,5 +1,7 @@
 # URL shortener
 
+## Summary of Implementations
+
 Parts 1–4 are implemented, plus the Part 5 load-balancer/shared-store architecture
 proposal and Part 6 graceful shutdown and create rate limiting. The two runtime
 backends are memory and file-backed JSON; the distributed architecture is a design,
@@ -7,28 +9,29 @@ not a running cluster. Only Go stdlib is used.
 
 ## Run
 
-The module currently targets Go 1.27. From the repository root:
+Simplest run command from the repository root:
 
 ```bash
-go run -buildvcs=false ./cmd/server -addr :8080 -base http://localhost:8080
+go run ./cmd/server
 ```
 
-For links that survive restart:
+It serves on localhost:8080 by default and keep the urls in memory.
+
+To maintain and load links after restart:
 
 ```bash
-go run ./cmd/server -addr :8080 -base http://localhost:8080 \
-  -store file -data ./data/links.json
+go run ./cmd/server -store file -data ./data/links.json
 ```
 
 | Flag              | Default               | Meaning                                                 |
 | ----------------- | --------------------- | ------------------------------------------------------- |
-| -addr             | :8080                 | HTTP listen address                                     |
-| -base             | http://localhost:8080 | Public URL prefix; trailing slash accepted              |
-| -store            | memory                | memory or file                                          |
-| -data             | data/links.json       | Snapshot path for the file backend                      |
-| -create-rate      | 5                     | POST requests/second per process; 0 disables the limit  |
-| -create-burst     | 20                    | Initial and maximum token capacity                      |
-| -shutdown-timeout | 10s                   | Maximum drain time before connections are forced closed |
+| -addr             | :8080                 | HTTP listen port                                        |
+| -base             | http://localhost:8080 | URL prefix used for shortening; trailing slash accepted |
+| -store            | memory                | where to store, memory or file                          |
+| -data             | data/links.json       | snapshot path for the urls data file                    |
+| -create-rate      | 5                     | POST requests/second per process; 0 for no limit        |
+| -create-burst     | 20                    | initial and maximum token capacity                      |
+| -shutdown-timeout | 10s                   | maximum drain time before connections are forced closed |
 
 ## HTTP API
 
@@ -39,24 +42,32 @@ curl -i -X POST http://localhost:8080/api/shorten \
 
 Success returns 201 with code and short_url. Repeat the same URL to reuse its code
 and original created_at, including after restart with file storage. URL equality
-uses exact input strings; URLs with and without a trailing slash are distinct.
+uses exact input strings; URLs with and without a trailing slash are distinct for sure.
 Codes currently have six random alphanumeric characters plus a checksum suffix.
 
-Replace CODE with the returned code:
+See DECISIONS.md for more details of:
+
+- same URL -> same code
+- code generation algorithm
+- collision handling
+
+Example curl commands with replacing the generated code:
 
 ```bash
-curl -i http://localhost:8080/CODE
-curl -I http://localhost:8080/CODE
-curl -L http://localhost:8080/CODE
-curl -i http://localhost:8080/api/v1/links/CODE
+curl -i http://localhost:8080/{code}
+curl -I http://localhost:8080/{code}
+curl -L http://localhost:8080/{code}
+curl -i http://localhost:8080/api/v1/links/{code}
 ```
 
-GET/HEAD /CODE returns 302 with Location. Metadata returns 200 with url and
-created_at (UTC RFC3339). Unknown codes return 404. Invalid/missing URLs and
-malformed JSON return 400; registered endpoints return JSON errors shaped as
-{"error":"message"}. Unsupported methods return 405, unexpected storage failures
-return 500, and rate-limited creates return 429 plus Retry-After in seconds.
-The service validates http/https and an absolute host and never fetches submitted URLs.
+- GET/HEAD /{code} returns 302 with Location. Metadata returns 200 with url and
+  created_at in UTC RFC3339 format.
+- Unknown codes return 404. Invalid/missing URLs and
+  malformed JSON return 400; registered endpoints return JSON errors shaped as
+  {"error":"message"}.
+- Unsupported methods return 405, unexpected storage failures
+  return 500, and rate-limited creates return 429 plus Retry-After in seconds.
+- The service validates http/https and an absolute host and never fetches submitted URLs.
 
 ## Persistence and restart
 
@@ -78,11 +89,6 @@ and file/directory fsync. The backend does not coordinate multiple processes.
 Full snapshots take O(number of links) work per new URL and all records are
 loaded into memory. This is the assignment backend, not the shared store proposed
 for multiple replicas in DECISIONS.md.
-
-To verify restart, create a link, save its code and metadata, stop the server,
-restart with the same -data path, then fetch metadata/redirect and shorten the
-same URL again. The code and created_at must be unchanged. TODO.md contains
-copyable commands for this sequence.
 
 ## Graceful shutdown and rate limiting
 
@@ -131,7 +137,7 @@ server's rate-limit middleware, network transport, and file persistence:
 go test -run '^$' -bench=. -benchmem ./...
 ```
 
-Linux amd64, Go go1.27.0-X:nodwarf5, Intel Core i5-1235U, measured 2026-10-09:
+Results of testing on my laptop and go version go1.27.0-X:nodwarf5:
 
 ```text
 BenchmarkShorten/Duplicate-12   233686   5188 ns/op   6973 B/op   31 allocs/op
@@ -158,6 +164,3 @@ Measured insight: bufio.NewReaderSize accounted for **65.69%** of sampled alloca
 bytes in the redirect benchmark. The request-construction harness dominates
 allocation cost, so these numbers do not establish live-server allocation costs
 or CPU bottlenecks. alloc_space measures cumulative allocation, not retained memory.
-
-See TODO.md for grading commands, CHECKLIST.md for verified requirements, and
-DECISIONS.md for implementation choices, architecture, limitations, and AI use.

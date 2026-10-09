@@ -10,23 +10,36 @@
   Duplicate calls skip code generation and preserve the original timestamp.
 - **Code generation:** New URLs receive six random alphanumeric characters drawn with
   crypto/rand.Int from a 62-character alphabet plus the existing weighted checksum
-  suffix, producing seven characters. The checksum adds no random entropy and
-  is not a guarantee of detecting every transcription error. Uniform cryptographic randomness
-  avoids predictable counters; only stdlib is used. Random-source failures return errors.
+  suffix, producing seven characters. The checksum is not a guarantee
+  of detecting every transcription error. It prevents redirection to a different
+  URL by changing some characters of code randomly.
 - **Collision handling:** Create checks candidates while holding its write lock,
   retries up to 128 times, then wraps ErrCodeCollision. Failed generation/exhaustion
   does not insert records or overwrite occupied codes. Deterministic test generators
   exercise retries, exhaustion, and failure without relying on random collisions.
-- **Mutex and lock boundaries:** Create takes Lock across both indexes, allocation,
-  and timestamp insertion. Get uses RLock and returns a record value. This makes
-  duplicate allocation atomic and permits concurrent reads.
+- **Mutex and lock boundaries:** Create (store method) takes Lock across both indexes,
+  allocation, and timestamp insertion. Get uses RLock and returns a record value.
+  This makes duplicate allocation atomic and permits concurrent reads.
 - **Package layout:** cmd/server composes configuration, Store, service, handler,
   and server. domain defines shared records/errors/contracts. service validates
   and wraps errors; storage owns atomic allocation and records; handler owns HTTP.
-- **Configuration and responses:** -addr defaults to :8080; -base defaults to
-  http://localhost:8080. Flags are parsed before use; the handler removes trailing
+- **Configuration and responses:** -addr is :8080 and -base is http://localhost:8080
+  by default. Flags are parsed before use; the handler removes trailing
   slashes and appends one separator. Shorten returns 201 with code and short_url;
   redirects accept GET and HEAD on one code segment. No submitted URL is fetched.
+
+### A note on code generation
+
+In the project documentation it is mentioned that by a same URL a same code should
+be generated and that indicates an algorithm which would generate same code, but it
+is not good with collisions, like if there is a unique way to generate the code from
+URL, so there also will be a unique way to generate another code after a collision
+then this algorithm treats collisions just like the nodes of a linkedlist and goes
+to end of the list on every collision.
+
+So I sticked to the random code generation and duplex way to access URL records as
+code-to-record and URL-to-code slices, so after a collision the new code is generated
+randomly that reduces happening another collision probability.
 
 ## Part 2
 
