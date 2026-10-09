@@ -2,190 +2,187 @@
 
 ## Part 1
 
-- **URL normalization:** Equality uses the exact submitted string. Case,
-  trailing slashes, fragments, and query ordering are preserved. This avoids
-  silently merging URLs whose meaning may differ; http/https and a host are required.
-- **Idempotency storage:** MemoryStorage maintains code-to-record and URL-to-code
-  indexes. Create checks duplicates and updates both indexes under one write lock.
-  Duplicate calls skip code generation and preserve the original timestamp.
-- **Code generation:** New URLs receive six random alphanumeric characters drawn with
-  crypto/rand.Int from a 62-character alphabet plus the existing weighted checksum
-  suffix, producing seven characters. The checksum is not a guarantee
-  of detecting every transcription error. It prevents redirection to a different
-  URL by changing some characters of code randomly.
-- **Collision handling:** Create checks candidates while holding its write lock,
-  retries up to 128 times, then wraps ErrCodeCollision. Failed generation/exhaustion
-  does not insert records or overwrite occupied codes. Deterministic test generators
-  exercise retries, exhaustion, and failure without relying on random collisions.
-- **Mutex and lock boundaries:** Create (store method) takes Lock across both indexes,
-  allocation, and timestamp insertion. Get uses RLock and returns a record value.
-  This makes duplicate allocation atomic and permits concurrent reads.
-- **Package layout:** cmd/server composes configuration, Store, service, handler,
-  and server. domain defines shared records/errors/contracts. service validates
-  and wraps errors; storage owns atomic allocation and records; handler owns HTTP.
-- **Configuration and responses:** -addr is :8080 and -base is http://localhost:8080
-  by default. Flags are parsed before use; the handler removes trailing
-  slashes and appends one separator. Shorten returns 201 with code and short_url;
-  redirects accept GET and HEAD on one code segment. No submitted URL is fetched.
+- **URL normalization:** Two URLs are treated as the same only when their complete
+  strings match. I keep case, trailing slashes, fragments, and query order because
+  changing them could merge links that have different meanings.
+- **Idempotency storage:** Used two maps: code-to-record and URL-to-code. This
+  lets me find a link in either direction without scanning every record. I check
+  for an existing URL before generating a code, so duplicates keep their code
+  and creation time.
+- **Code generation:** Six random alphanumeric characters are generated with
+  crypto/rand and added a weighted checksum as the seventh character. I chose
+  randomness to avoid predictable counter codes and kept the checksum as a basic
+  aid against typing mistakes. Lookup still uses the exact stored code; the
+  checksum does not guarantee typo detection or prevent every wrong redirect.
+- **Collision handling:** First checked whether a new code is already used and retry
+  up to 128 times. I chose a limit so a failing generator cannot loop forever.
+  If all attempts fail, ErrCodeCollision is returned without overwriting a record.
+- **Mutex and lock boundaries:** I used RWMutex. Create holds a write lock through
+  duplicate lookup, code allocation, and both map updates, so concurrent requests
+  cannot allocate different codes for the same URL. Get uses a read lock, allowing
+  several lookups at once. (Create & Get are store methods)
+- **Package layout:** I kept startup and configuration in cmd/server, HTTP work
+  in handler, validation and error wrapping in service, and record management in
+  storage. domain holds shared types and errors. I chose these boundaries so I
+  can change storage without changing the HTTP API.
+- **Configuration and validation:** I used the required defaults: -addr :8080 and
+  -base http://localhost:8080. Allowed a trailing slash in -base and add one
+  separator when building short_url. Only absolute http/https URLs are accepted and
+  no submitted URL is fetched.
 
 ### A note on code generation
 
-In the project documentation it is mentioned that by a same URL a same code should
-be generated and that indicates an algorithm which would generate same code, but it
-is not good with collisions, like if there is a unique way to generate the code from
+In the project documentation it is mentioned that the same URL should return the same
+and that indicates an algorithm which would generate the same code, but it is not
+good with collisions, like if there is a unique way to generate the code from
 URL, so there also will be a unique way to generate another code after a collision
-then this algorithm treats collisions just like the nodes of a linkedlist and goes
-to end of the list on every collision.
+then this algorithm treats collisions just like the nodes of a linked list and goes
+to the end of the list on every collision.
 
-So I sticked to the random code generation and duplex way to access URL records as
+So I stuck to the random code generation and duplex way to access URL records as
 code-to-record and URL-to-code slices, so after a collision the new code is generated
-randomly that reduces happening another collision probability.
+randomly that reduces the probability of another collision.
 
 ## Part 2
 
-- **Store interface location and methods:** Store is declared at the main consumer
-  boundary by embedding the shared domain.Store contract. Create(rawURL, generator)
-  returns code/error; Get(code) returns URLRecord/error. MemoryStorage and test fakes
-  satisfy this contract; the service accepts the shared interface so it does not
-  import main. The handler also depends on a small LinkService interface.
-- **Errors to HTTP:** ErrInvalidURL maps to 400 and ErrNotFound to 404 using
+- **Store interface:** Store is declared in main using the shared domain.Store
+  interface. Its methods are Create(rawURL, generator), which returns a code or
+  error, and Get(code), which returns a record or error. I share the contract in
+  domain so the service can use it without importing main. Both storage backends
+  and test fakes implement it, making storage replaceable and errors easy to test.
+- **HTTP errors:** ErrInvalidURL maps to 400 and ErrNotFound to 404 using
   errors.Is after contextual %w wrapping. Other errors map to 500. API error bodies
-  use {"error":"message"}; store error details and full submitted URLs are not exposed.
+  use {"error":"message"}; so clients get one consistent format without internal error
+  details. store error details and full submitted URLs are not exposed.
   Each error branch returns immediately. Unsupported methods return 405 with Allow.
-- **Existing sentinel errors:** ErrEmptyURL and ErrInvalidSchema wrap ErrInvalidURL,
-  preserving specific identities while giving all invalid input the required 400 mapping.
-- **Metadata representation and routing:** Go wildcard routes extract code with
-  PathValue. Exported URL and CreatedAt fields encode as url and created_at.
-  Creation timestamps are UTC RFC3339 strings assigned once on successful insertion.
-- **Idempotency through Store:** Allocation is a Store operation rather than
-  separate Exists/Save calls. HTTP, service, and concurrent tests verify code reuse;
-  storage tests explicitly check unchanged historical timestamps on duplicates.
-- **JSON handling:** Shorten accepts exactly one JSON value; malformed input or
-  trailing values are rejected. Once response headers have been sent, write failures
-  are logged generically rather than attempting to send a second status/body.
+- **Specific validation errors:** I made ErrEmptyURL and ErrInvalidSchema wrap
+  ErrInvalidURL. This keeps their specific meanings while letting one handler
+  rule return 400 for all invalid URLs.
+- **Metadata:** The code is extracted with PathValue and return exported fields
+  tagged as url and created_at. I used UTC RFC3339 timestamps as it was mentioned
+  in project documentation. A duplicate shorten request keeps the original
+  timestamp because it refers to the same stored link.
+- **Idempotency through Store:** I put allocation inside Create instead of making
+  separate Exists and Save calls. This keeps duplicate checking and insertion
+  together under one lock, including after changing the storage backend.
+- **JSON responses:** I accept one JSON value per request to reject extra or
+  malformed data. If writing a response fails after headers are sent,
+  it would be logged as a generic message because sending another
+  HTTP error would mix two responses.
 
 ## Part 3
 
-- **Locking choice:** RWMutex fits the expected many-redirects/fewer-creates workload.
-  Get can run concurrently; Create requires an exclusive lock. Code generation
-  happens inside the write lock for straightforward correctness. Actual contention
-  has not been benchmarked against Mutex; do not claim this choice was proven faster.
-- **Timeouts and slow clients:** ReadHeaderTimeout is 5 seconds to limit slow
-  headers. ReadTimeout is 10 seconds for reading the request including its body.
-  WriteTimeout is 10 seconds to bound slow response writes. IdleTimeout is 60 seconds
-  for idle keep-alive connections. This small JSON API has no long-lived streaming
-  responses; these defaults should be reassessed for a different workload.
-- **Eviction cap:** The memory store is intentionally unbounded for the single-process
-  assignment. Eviction would invalidate old links and weaken same-URL idempotency;
-  capacity limits are deferred rather than silently deleting data. Part 4 will add
-  durability, not automatically a memory or capacity policy.
-- **Measurement method:** Handler benchmarks use httptest through the mux and
-  include request/recorder construction. Duplicate shortening and redirects are
-  seeded outside timing. New URL creation resets stores every 1024 entries outside
-  timing to keep memory bounded. Actual measurements are in README.md.
-- **Profiling:** CPU profiling was killed immediately in two attempts on this host.
-  Successful pprof alloc_space output shows benchmark request construction dominates
-  sampled allocated bytes. This is an allocation insight about the harness, not a
-  CPU or production-throughput conclusion. See README.md for values and commands.
+- **Locking choice:** I chose RWMutex because I expect more redirects and metadata
+  reads than new links. Readers can run together, while creates take an exclusive
+  lock. I keep generation inside the write lock to make allocation atomic. I have
+  not benchmarked RWMutex against Mutex, so this is a workload-based choice.
+- **Timeouts:** I set ReadHeaderTimeout to 5s, ReadTimeout to 10s, WriteTimeout to
+  10s, and IdleTimeout to 60s. They limit slow headers, request bodies, response
+  writes, and idle keep-alive connections. I chose short read/write limits because
+  the API handles small JSON requests, and a longer idle limit to allow connection reuse.
+- **Memory limit:** I do not evict links or set a capacity limit for this project.
+  Eviction would break old links and could give the same URL a different code.
+  I accept growing memory use for the single-process assignment.
+- **Benchmarks:** Benchmarked duplicate shortening, new URLs, and redirects through
+  the HTTP handlers and router. I exclude setup from timing and reset the new-URL
+  store every 1024 creates to keep benchmark memory bounded. I include request and
+  recorder construction, so the results describe this test path rather than live
+  network performance. The measured results are in README.md.
+- **Profiling:** I couldn't see cpu profile results on my device. I tried the
+  standard -cpuprofile command, but the run was terminated before I could inspect
+  its output. I used allocation profiling instead to get a measured insight:
+  request construction accounts for much of the benchmark's allocated memory.
 
 ## Part 4 — Persistence
 
-- **Storage choice:** File-backed JSON uses encoding/json and os with no extra
-  modules. It fits a single-process assignment and is easy to inspect and test;
-  full-snapshot writes and startup loading are deliberately unsuitable for millions
-  of links or multiple writer processes. One active writer per path is required.
-- **Schema and migrations:** The snapshot contains version: 1 and a links map from
-  code to URLRecord (url and created_at). URL-to-code is derived on startup, avoiding
-  a separately persisted index that could drift. Unknown fields/versions, malformed
-  input, bad codes/URLs/timestamps, and duplicate URLs fail startup. There is no ORM
-  or SQL migration; future format changes need an explicit version migration.
-- **Crash safety and atomicity:** Create holds the file-store write lock, clones both
-  indexes, allocates using the memory-store collision rules, then writes a complete
-  candidate JSON snapshot. The temporary file is in the destination directory, mode
-  0600; it is synced and closed before atomic rename. The directory is synced before
-  the candidate becomes visible or Create returns success. Newly created parent
-  directories and their nearest existing ancestor are also synced on startup.
-  Guarantees assume a filesystem honoring atomic rename and file/directory fsync.
-- **Failure recovery:** Before rename, failures leave the previous snapshot/indexes
-  untouched. After rename, a sync error means an ambiguous commit: the process
-  fails closed for reads/writes until restart instead of serving stale memory.
-  Restart loads a complete surviving snapshot. An error response may correspond
-  to a committed write; same-URL retry safely recovers the original link. Temporary
-  files left by abrupt termination are ignored as uncommitted candidates.
-- **created_at:** UTC RFC3339 strings round-trip unchanged in JSON. Duplicate
-  creation returns before allocating/writing and never changes timestamps.
-- **Idempotency after restart:** Startup rebuilds both indexes and rejects duplicate
-  URLs. One write lock spans duplicate lookup, allocation, persistence, and index
-  publication. Reopen, HTTP restart, timestamp, collision, failed-write, and
-  concurrent durable-store tests verify these contracts.
-- **Configuration:** -store memory is the default; -store file selects persistence
-  at -data (default data/links.json). The backend loads before listen; startup and
-  listen errors return a nonzero exit. There are no long-lived file handles to close.
+- **Storage choice:** I chose file-backed JSON because it needs no database setup
+  or extra modules and is easy to inspect and test. It supports one writer process
+  per file path. Each create rewrites the full snapshot, so I use it for this
+  assignment rather than a large distributed service.
+- **File format and startup:** The snapshot contains version: 1 and a links map from
+  code to URLRecord (url and created_at). The URL-to-code index is rebuilt on startup so
+  two saved indexes cannot disagree. Unsupported versions, malformed
+  records, and duplicate URLs are rejected to avoid silently losing or changing links.
+- **Crash safety:** I prepare a new snapshot while holding the write lock. I write
+  it to a temporary file in the same directory, sync and close it, rename it
+  atomically, and sync the directory before returning success. I also sync newly
+  created directories and their nearest existing parent. I chose this sequence
+  to keep a complete previous or new snapshot after interruption and persist
+  before HTTP 201. It requires a filesystem supporting rename and file/directory fsync.
+- **Failed writes:** Before rename, I keep the previous file and maps unchanged.
+  If rename succeeds but directory sync fails, I return an error and stop serving
+  store reads/writes until restart because the committed state is uncertain.
+  Restart loads the complete snapshot that survived. A client can retry the same
+  URL without creating a different link if the failed request actually committed.
+- **created_at:** The original UTC RFC3339 string is saved in JSON and loaded
+  unchanged. It is not upgraded on duplicates, because it records the link's
+  creation rather than its most recent request.
+- **Idempotency after restart:** I rebuild both maps from the saved records and
+  hold one write lock through lookup, allocation, persistence, and map publication.
+  This preserves the same-URL rule during concurrent requests and after restart.
+  Temporary-directory, reopen, HTTP, collision, and failure tests check this behavior.
+- **Backend configuration:** I kept memory as the default for a simple run and
+  use -store file with -data (default data/links.json) for persistence. I load
+  storage before listening so a bad file causes a clear startup failure instead
+  of starting with missing records. Temporary files use mode 0600 and newly
+  created directories use 0700 to limit access to stored URLs.
 
 ## Part 5 — LB → N apps → shared store
 
 ```text
-Clients → Load balancer → N Go replicas → Shared PostgreSQL
+Proposed (not built): Clients → Load balancer → N Go replicas → Shared PostgreSQL
+Implemented (today):  Clients → single process → MemoryStorage or file-backed JSON
 ```
 
-- The load balancer distributes requests among replicas. Authoritative link state
-  lives in the shared store, so a request can reach any replica without sticky
-  sessions. The current memory/file backends would be replaced by a database Store;
-  separate per-replica files or shared-file concurrent writers are not this design.
-- PostgreSQL would store code as a primary key, URL under a unique constraint with
-  equality matching the exact-string normalization policy, and creation timestamp.
-  A transaction finds/reuses an existing URL or inserts a new code and commits
-  before 201. Unique-code conflicts retry allocation; concurrent URL conflicts
-  resolve to the winning row, preserving idempotency across replicas.
-- The load balancer improves capacity and app availability, but the shared database
-  adds operational cost, network latency, and a common availability dependency.
-  Use bounded connection pools, backups, and database failover. During database
-  failure, return an error rather than falling back to isolated memory stores that
-  could issue incompatible codes. Database reads define consistency; no distributed
-  cache or stale-read policy is implemented or claimed here.
-- Each replica's local rate bucket has its own budget; a fleet-wide limit would be
-  enforced at the gateway or via coordinated shared storage. Replica count alone
-  does not produce a global limit. This section is an architecture proposal, not
-  an implemented distributed backend or load-balancer deployment.
+- I would put several Go replicas behind a load balancer and
+  keep link records in one shared store such as Redis or PostgreSQL. Any replica
+  could handle a request without sticky sessions, because the records would not
+  depend on a replica's local memory. Today's file backend cannot do this: it
+  supports one writer process per file path, so it is not a shared store.
+- I would use a code primary key and a unique URL constraint.
+  Transactions would commit before 201; code collisions would retry, and concurrent
+  inserts of the same URL would reuse the winning record. I would choose database
+  constraints to enforce uniqueness across processes rather than relying on each
+  replica's mutex. This is a database design I have not built.
+- This would improve app capacity and availability but add database maintenance,
+  network latency, and a shared failure dependency. I would use bounded connection
+  pools, backups, and failover. If the database failed, I would return an error
+  because isolated memory fallbacks could issue conflicting links.
+- I would coordinate rate limits at a gateway or shared store because each
+  replica's current bucket has its own budget. The rate limiter that exists in the
+  code is a single in-process token bucket, so extra replicas would each get a
+  separate budget. I have not added a distributed cache, so no stale-cache
+  behavior is claimed.
 
 ## Part 6 — Graceful shutdown and create rate limiting
 
-- **Shutdown drain:** signal.NotifyContext listens for SIGINT and SIGTERM. A
-  separate shutdown context allows in-flight work to continue after the signal;
-  Server.Shutdown stops listening and drains active requests for up to
-  -shutdown-timeout (10s default). Completed file writes are committed before
-  responses. At the deadline, Server.Close forces connections closed and the
-  process exits with an error. A client may not receive a committed response;
-  retrying the same URL recovers the code. SIGKILL cannot drain requests.
-- **Verification:** Tests use a real listener and a blocked handler to prove the
-  drain waits for in-flight completion and the timeout forces closure. A real
-  binary was also exercised with SIGTERM/SIGINT and reopened durable records.
-- **Rate limit:** A process-wide mutex-protected token bucket starts full at 20
-  tokens, refilling at 5 requests/second. -create-rate and -create-burst configure
-  it; rate 0 disables it. Positive burst, finite/nonnegative rate, and positive
-  shutdown duration are validated. Rejection is JSON 429 with Retry-After rounded
-  up to whole seconds. Only POST /api/shorten consumes tokens, including invalid
-  and duplicate submissions. Reads and unsupported methods are unaffected.
-- **Tradeoffs:** A global bucket has bounded memory and no proxy/IP trust issue,
-  but unrelated clients share a budget and each replica gets a separate budget.
-  A distributed deployment needs gateway/shared enforcement. Refill and concurrent
-  admission tests check limits deterministically without timing-dependent sleeps.
-- **Blocklist rules:** Only existing http/https/host validation is applied. No
-  domain blocklist/allowlist bonus is claimed.
-- **Observability:** Startup/listen/shutdown errors and generic response-write
-  failures are logged. There is no request URL logging or metrics endpoint; full
-  submitted URLs and query strings are not logged. Extra metrics/logging bonuses
-  are not claimed.
+- **Shutdown:** signal.NotifyContext listens for SIGINT and SIGTERM, Server.Shutdown
+  runs under a separate context. This stops new connections
+  while allowing in-flight requests to finish. I chose a 10s default drain limit
+  to avoid waiting forever; -shutdown-timeout can change it. At the deadline I
+  close connections and exit with an error. SIGKILL cannot drain requests, and
+  clients may need to retry if a write committed before their connection closed.
+- **Shutdown tests:** I used a real listener and a blocked handler to check both
+  successful draining and forced closure at the deadline. I also checked a built
+  process with SIGTERM/SIGINT and verified that its saved links survived restart.
+- **Rate limit:** I used one token bucket per process to keep memory use bounded
+  without storing client IPs. It starts with 20 tokens and refills at 5 requests/s,
+  allowing a small burst while limiting sustained creates. -create-rate and
+  -create-burst configure it; rate 0 disables it. Only POST /api/shorten consumes
+  tokens, including invalid and duplicate requests, so read traffic stays available.
+  Rejections return JSON 429 and Retry-After rounded up to whole seconds.
+- **Rate-limit tradeoff:** Clients share the process budget, and extra replicas
+  add separate budgets. I accept this simple limit here; a shared deployment
+  needs coordinated enforcement. Refill and concurrent tests check the behavior.
 
 ## AI assistance
 
-AI was used, at the user's request, to implement the Store refactor, related fixes,
-tests/benchmarks/timeouts, implement file persistence, graceful shutdown and rate
-limiting, review existing work, and update documentation. Earlier
-assistance included requirement review and metadata-route debugging. The project
-brief restricts AI to search/consultation; this entry records the actual use rather
-than claiming the generated implementation was written without assistance.
+I used AI assistance for requirement review, debugging, refactoring, tests,
+benchmarks, and documentation. I used it to put TODO comments in code based on each
+part tasks and it very helped in implementing features, meanwhile it refactored some
+parts of my code. And also i asked AI to completely figure out what project documentation
+actually wants and what should i do for it. It also helped me to complete .md
+files like told it to check my decisions with project documentation and fix my
+grammar too.
 
-<!-- No external modules are currently used. Add ## Dependencies if modules other
-than an allowed web framework/router or GORM plus its SQL driver are introduced.
-List import path, purpose, and why stdlib/the allowed stack was insufficient. -->
+I used only Go's standard library and no external dependencies so there ain't no explain.
